@@ -59,7 +59,9 @@ def get_video_details(file_path):
         return None, 0, 0
 
 
-def compress_video_gpu(input_file, output_file, total_frames, crf=26, resize=None):
+def compress_video_gpu(
+    input_file, output_file, total_frames, relative_path, crf=26, resize=None
+):
     """
     Compresses a video using NVENC and displays real-time progress.
     """
@@ -133,7 +135,7 @@ def compress_video_gpu(input_file, output_file, total_frames, crf=26, resize=Non
                     # Create the progress string and print it on a single, updating line
                     progress_text = (
                         f"[GPU] [{percent:3.1f}%] "
-                        f"Encoding... ({fps}fps @ {bitrate})"
+                        f"Encoding {relative_path} ({fps}fps @ {bitrate})"
                     )
                     sys.stdout.write(f"\r{progress_text}")
                     sys.stdout.flush()
@@ -143,13 +145,11 @@ def compress_video_gpu(input_file, output_file, total_frames, crf=26, resize=Non
                 continue
 
         # Print a newline to move off the progress line
-        sys.stdout.write("\r" + " " * 80 + "\r")  # Clear the line
+        sys.stdout.write("\r" + " " * 120 + "\r")  # Clear the line
         sys.stdout.flush()
 
         if process.returncode != 0:
-            print(
-                f"[ERROR] FFmpeg failed on {os.path.basename(input_file)}. Copying original."
-            )
+            print(f"[ERROR] FFmpeg failed on {relative_path}. Copying original.")
             shutil.copy2(input_file, output_file)
 
     finally:
@@ -169,9 +169,7 @@ def process_files_recursively(root_input, root_output, crf=26, resize=None):
         relative_path = os.path.relpath(input_path, root_input)
         output_path = os.path.join(root_output, relative_path)
 
-        print(
-            f"\n--- Processing file {i + 1} of {total_files}: {os.path.basename(input_path)} ---"
-        )
+        print(f"\n--- Processing file {i + 1} of {total_files}: {relative_path} ---")
 
         if os.path.exists(output_path):
             print("Output file already exists. Skipping.")
@@ -188,7 +186,12 @@ def process_files_recursively(root_input, root_output, crf=26, resize=None):
             else:
                 print("Video requires compression. Starting GPU encoder...")
                 compress_video_gpu(
-                    input_path, output_path, total_frames, crf=crf, resize=resize
+                    input_path,
+                    output_path,
+                    total_frames,
+                    relative_path,
+                    crf=crf,
+                    resize=resize,
                 )
         else:
             print("Not a video file. Copying directly...")
