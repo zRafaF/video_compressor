@@ -1,3 +1,5 @@
 input/*
 output/*
 venv/
+!input/.placeholder
+!output/.placeholder
