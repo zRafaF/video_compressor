@@ -9,16 +9,16 @@ import tempfile
 # --- Configuration ---
 input_folder = "input"
 output_folder = "output"
-VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv")
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v")
 
 # --- H.265 (HEVC) Encoding Settings ---
 # Constant Rate Factor (CRF). Lower value = better quality, larger file.
 # For NVENC, a good range is 20-28.
-H265_CRF = 26
+H265_CRF = 28
 # GPU Encoder Preset. p1-p7 (fastest (lowest quality) to slowest (best quality)). 'p6' is a good balance.
 GPU_PRESET = "p6"
 # Set a threshold. Videos below this bitrate (in bps) will be copied.
-BITRATE_THRESHOLD = 2_000_000
+BITRATE_THRESHOLD = 1_500_000
 # Audio setting. 'copy' is fastest and avoids re-encoding.
 AUDIO_CODEC = "copy"
 
@@ -64,10 +64,10 @@ def compress_video_gpu(
 ):
     """
     Compresses a video using NVENC and displays real-time progress.
+    Now with better error handling and subtitle stripping.
     """
     progress_file_path = ""
     try:
-        # Create a temporary file for ffmpeg to write its progress to
         with tempfile.NamedTemporaryFile(delete=False, mode="w+", suffix=".txt") as tmp:
             progress_file_path = tmp.name
 
@@ -89,6 +89,7 @@ def compress_video_gpu(
             "0",
             "-c:a",
             AUDIO_CODEC,
+            "-sn",  # <-- KEY ADDITION: Strips subtitle streams
             "-y",
             "-progress",
             progress_file_path,
@@ -101,27 +102,28 @@ def compress_video_gpu(
             command.insert(-2, "-vf")
             command.insert(-2, f"scale_cuda={width}:{height}")
 
-        # Start the ffmpeg process
+        # Start the ffmpeg process, now capturing stderr
         process = subprocess.Popen(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
         )
 
-        # Monitor the progress file
+        # Monitor progress file (same as before)
         while process.poll() is None:
             time.sleep(0.5)
             try:
                 with open(progress_file_path, "r") as f:
-                    # Go to the end of the file to get the latest progress
                     f.seek(0, os.SEEK_END)
                     if f.tell() == 0:
-                        continue  # Skip if file is empty
-                    f.seek(
-                        max(0, f.tell() - 512)
-                    )  # Seek back a bit to read recent lines
+                        continue
+                    f.seek(max(0, f.tell() - 512))
                     lines = f.readlines()
 
                 progress_data = {}
-                for line in lines[-12:]:  # Only parse the last few lines for speed
+                for line in lines[-12:]:
                     if "=" in line:
                         key, value = line.strip().split("=", 1)
                         progress_data[key] = value
@@ -131,35 +133,38 @@ def compress_video_gpu(
                     percent = (current_frame / total_frames) * 100
                     fps = progress_data.get("fps", "0.0")
                     bitrate = progress_data.get("bitrate", "N/A")
-
-                    # Create the progress string and print it on a single, updating line
                     progress_text = (
                         f"[GPU] [{percent:3.1f}%] "
                         f"Encoding {relative_path} ({fps}fps @ {bitrate})"
                     )
                     sys.stdout.write(f"\r{progress_text}")
                     sys.stdout.flush()
-
             except (FileNotFoundError, IndexError):
-                # Ignore if the progress file isn't ready or is empty
                 continue
 
-        # Print a newline to move off the progress line
-        sys.stdout.write("\r" + " " * 120 + "\r")  # Clear the line
+        sys.stdout.write("\r" + " " * 120 + "\r")
         sys.stdout.flush()
 
+        # Check for errors and print them
+        stdout, stderr = process.communicate()
         if process.returncode != 0:
-            print(f"[ERROR] FFmpeg failed on {relative_path}. Copying original.")
+            print(f"[ERROR] FFmpeg failed on {relative_path}.")
+            print("--- FFmpeg Error Output ---")
+            print(stderr if stderr else "No error output captured.")
+            print("---------------------------")
+            print("Copying original file instead.")
             shutil.copy2(input_file, output_file)
 
     finally:
-        # Ensure the temporary progress file is always deleted
         if os.path.exists(progress_file_path):
             os.remove(progress_file_path)
 
 
 def process_files_recursively(root_input, root_output, crf=26, resize=None):
-    """Recursively scans and intelligently processes files one by one."""
+    """
+    Recursively scans files, changing .m4v to .mp4 on output,
+    and preserving all other extensions.
+    """
     all_files_to_process = [
         os.path.join(dp, f) for dp, dn, fn in os.walk(root_input) for f in fn
     ]
@@ -167,7 +172,18 @@ def process_files_recursively(root_input, root_output, crf=26, resize=None):
 
     for i, input_path in enumerate(all_files_to_process):
         relative_path = os.path.relpath(input_path, root_input)
-        output_path = os.path.join(root_output, relative_path)
+
+        # --- START OF MODIFICATION ---
+        # Get the original filename and extension
+        relative_path_without_ext, original_ext = os.path.splitext(relative_path)
+
+        # Decide the output extension based on the original
+        output_ext = ".mp4" if original_ext.lower() == ".m4v" else original_ext
+
+        # Construct the new output path with the correct extension
+        output_relative_path = relative_path_without_ext + output_ext
+        output_path = os.path.join(root_output, output_relative_path)
+        # --- END OF MODIFICATION ---
 
         print(f"\n--- Processing file {i + 1} of {total_files}: {relative_path} ---")
 
@@ -177,14 +193,17 @@ def process_files_recursively(root_input, root_output, crf=26, resize=None):
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+        # Process video files
         if input_path.lower().endswith(VIDEO_EXTENSIONS):
             codec, bit_rate, total_frames = get_video_details(input_path)
 
+            # This condition handles videos that are already efficient and should just be copied.
+            # Even when copying a .m4v, we save it as a more compatible .mp4.
             if codec == "hevc" or (0 < bit_rate < BITRATE_THRESHOLD):
-                print("Video is already efficient. Copying file directly...")
+                print(f"Video is already efficient. Copying to {output_path}...")
                 shutil.copy2(input_path, output_path)
             else:
-                print("Video requires compression. Starting GPU encoder...")
+                print(f"Video requires compression. Encoding to {output_path}...")
                 compress_video_gpu(
                     input_path,
                     output_path,
@@ -193,6 +212,7 @@ def process_files_recursively(root_input, root_output, crf=26, resize=None):
                     crf=crf,
                     resize=resize,
                 )
+        # Directly copy non-video files
         else:
             print("Not a video file. Copying directly...")
             shutil.copy2(input_path, output_path)
