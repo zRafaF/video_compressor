@@ -14,11 +14,11 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m
 # --- H.265 (HEVC) Encoding Settings ---
 # Constant Rate Factor (CRF). Lower value = better quality, larger file.
 # For NVENC, a good range is 20-28.
-H265_CRF = 28
+H265_CRF = 27
 # GPU Encoder Preset. p1-p7 (fastest (lowest quality) to slowest (best quality)). 'p6' is a good balance.
 GPU_PRESET = "p6"
 # Set a threshold. Videos below this bitrate (in bps) will be copied.
-BITRATE_THRESHOLD = 1_500_000
+BITRATE_THRESHOLD = 2_000_000
 # Audio setting. 'copy' is fastest and avoids re-encoding.
 AUDIO_CODEC = "copy"
 
