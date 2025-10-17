@@ -3,3 +3,4 @@ output/*
 venv/
 !input/.placeholder
 !output/.placeholder
+ffmpeg2pass-0.log
