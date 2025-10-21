@@ -21,12 +21,9 @@ FFMPEG_PATH = "ffmpeg"
 SELECTED_PRESET = "best_quality_at_size"
 
 # 3. TARGET BITRATE (for "best_quality_at_size" preset ONLY)
-# This determines the final file size. Higher value = larger file, better quality.
-# Good values: 1080p -> 4000, 720p -> 2500, 4K -> 8000
 TARGET_BITRATE_KBPS = 2000
 
 # 4. SET MINIMUM COMPRESSION (in percent)
-# If compression saves less than this %, the original file is copied.
 MINIMUM_COMPRESSION_PERCENT = 10
 
 
@@ -59,9 +56,9 @@ config = QUALITY_PRESETS[SELECTED_PRESET]
 
 
 def get_video_details(file_path):
-    """Uses ffprobe to get video details."""
+    """Uses ffprobe to get video details, with a fallback for container bitrate."""
     ffprobe_path = FFMPEG_PATH.replace("ffmpeg", "ffprobe")
-    command = [
+    stream_command = [
         ffprobe_path,
         "-v",
         "quiet",
@@ -72,16 +69,40 @@ def get_video_details(file_path):
         "v:0",
         file_path,
     ]
+    format_command = [
+        ffprobe_path,
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        file_path,
+    ]
+
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, check=True, encoding="utf-8"
+            stream_command, capture_output=True, text=True, check=True, encoding="utf-8"
         )
         data = json.loads(result.stdout)
+
         if not data.get("streams"):
             return None, 0, 0
         stream = data["streams"][0]
+
         codec, bit_rate = stream.get("codec_name"), int(stream.get("bit_rate", 0))
         total_frames = int(stream.get("nb_frames", 0))
+
+        if bit_rate == 0:
+            format_result = subprocess.run(
+                format_command,
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding="utf-8",
+            )
+            format_data = json.loads(format_result.stdout)
+            bit_rate = int(format_data.get("format", {}).get("bit_rate", 0))
+
         if total_frames == 0:
             duration_str, fr_str = stream.get("duration", "0"), stream.get(
                 "avg_frame_rate", "0/1"
@@ -95,50 +116,66 @@ def get_video_details(file_path):
                         total_frames = int(duration * (num / den))
                 except (ValueError, ZeroDivisionError):
                     total_frames = 0
+
         return codec, bit_rate, total_frames
+
     except FileNotFoundError:
         print(
             f"\n[FATAL ERROR] Cannot find ffprobe. Please check the FFMPEG_PATH variable."
         )
-        print(f"Current path is set to: '{ffprobe_path}'")
         sys.exit(1)
     except (subprocess.CalledProcessError, json.JSONDecodeError, IndexError):
         return None, 0, 0
 
 
 def monitor_ffmpeg_progress(process, total_frames, progress_file_path, description):
-    """Displays a visual progress bar by monitoring an FFmpeg process."""
+    """
+    REWRITTEN: Displays a progress bar by reliably reading FFmpeg's dedicated progress file.
+    """
     bar_length = 40
+
+    # Wait for the progress file to be created
+    while (
+        not os.path.exists(progress_file_path)
+        or os.path.getsize(progress_file_path) == 0
+    ):
+        if process.poll() is not None:
+            return  # Process ended before progress file was made
+        time.sleep(0.1)
+
+    last_frame = 0
     while process.poll() is None:
-        time.sleep(0.5)
-        if not os.path.exists(progress_file_path):
-            continue
         try:
             with open(progress_file_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
 
-            progress_data = {
-                k.strip(): v.strip()
-                for line in lines[-12:]
-                if "=" in line
-                for k, v in [line.split("=", 1)]
-            }
+            progress_data = {}
+            for line in lines:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    progress_data[key] = value
 
-            if total_frames > 0 and "frame" in progress_data:
+            if "frame" in progress_data:
                 current_frame = int(progress_data["frame"])
-                percent = (current_frame / total_frames) * 100
-                filled_length = int(bar_length * current_frame // total_frames)
-                bar = "█" * filled_length + "-" * (bar_length - filled_length)
-                fps = float(progress_data.get("fps", 0.0))
+                if current_frame > last_frame:
+                    last_frame = current_frame
+                    percent = (
+                        (current_frame / total_frames) * 100 if total_frames > 0 else 0
+                    )
+                    filled_length = (
+                        int(bar_length * current_frame // total_frames)
+                        if total_frames > 0
+                        else 0
+                    )
+                    bar = "█" * filled_length + "-" * (bar_length - filled_length)
 
-                progress_text = (
-                    f"{description}: |{bar}| {percent:5.1f}% ({fps:.1f} fps)"
-                )
-                sys.stdout.write(f"\r{progress_text.ljust(80)}")
-                sys.stdout.flush()
+                    progress_text = f"{description}: |{bar}| {percent:5.1f}%"
+                    sys.stdout.write(f"\r{progress_text.ljust(80)}")
+                    sys.stdout.flush()
+        except (IOError, ValueError):
+            pass  # File might be locked, try again
 
-        except (IOError, ValueError, KeyError):
-            continue
+        time.sleep(0.5)
 
     bar = "█" * bar_length
     progress_text = f"{description}: |{bar}| 100.0% (Complete)"
@@ -146,29 +183,28 @@ def monitor_ffmpeg_progress(process, total_frames, progress_file_path, descripti
     sys.stdout.flush()
 
 
-def compress_video_gpu(
-    input_file, output_file, total_frames, relative_path, preset_config
-):
-    """Compresses a video using either Single-Pass CQ or Two-Pass VBR."""
+def compress_video_gpu(input_file, output_file, total_frames, preset_config):
+    """Compresses a video using the robust -progress file method and redirects logs."""
     progress_file_path = ""
+    log_file_path = os.path.splitext(output_file)[0] + "_ffmpeg_log.txt"
+
     try:
-        # Create a temporary file for progress reporting
-        with tempfile.NamedTemporaryFile(delete=False, mode="w+", suffix=".txt") as tmp:
+        with tempfile.NamedTemporaryFile(
+            delete=False, mode="w+", suffix=".txt", encoding="utf-8"
+        ) as tmp:
             progress_file_path = tmp.name
 
-        # Ensure the temp file is closed before FFmpeg uses it
-        # This is handled by the 'with' statement exiting.
+        base_args = [FFMPEG_PATH, "-nostdin", "-fflags", "+genpts"]
+
+        if input_file.lower().endswith(".mkv"):
+            base_args.extend(["-f", "matroska"])
+
+        base_args.extend(["-hwaccel", "cuda", "-i", input_file])
 
         if preset_config["MODE"] == "VBR":
             target_bitrate = f"{TARGET_BITRATE_KBPS}k"
             max_bitrate = f"{int(TARGET_BITRATE_KBPS * 1.5)}k"
-
-            common_args = [
-                FFMPEG_PATH,
-                "-hwaccel",
-                "cuda",
-                "-i",
-                input_file,
+            common_args = base_args + [
                 "-c:v",
                 "hevc_nvenc",
                 "-preset",
@@ -196,40 +232,50 @@ def compress_video_gpu(
                 progress_file_path,
             ]
 
-            # --- PASS 1 ---
-            pass1_args = common_args + ["-pass", "1", "-an", "-f", "null", os.devnull]
-            # THE FIX: Run Popen without piping stdout/stderr to avoid deadlocks
-            process1 = subprocess.Popen(
-                pass1_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            monitor_ffmpeg_progress(
-                process1, total_frames, progress_file_path, "Pass 1/2 Analyzing"
-            )
-            if process1.returncode != 0:
-                print(f"[ERROR] FFmpeg Pass 1 failed. Check for errors above.")
-                return False
+            with open(log_file_path, "w", encoding="utf-8") as log_file:
+                # Pass 1
+                pass1_args = common_args + [
+                    "-pass",
+                    "1",
+                    "-an",
+                    "-f",
+                    "null",
+                    os.devnull,
+                ]
+                process1 = subprocess.Popen(
+                    pass1_args, stdout=log_file, stderr=subprocess.STDOUT
+                )
+                monitor_ffmpeg_progress(
+                    process1, total_frames, progress_file_path, "Pass 1/2 Analyzing"
+                )
+                if process1.wait() != 0:
+                    print(f"\n[ERROR] FFmpeg Pass 1 failed. See log: {log_file_path}")
+                    return False
 
-            # --- PASS 2 ---
-            pass2_args = common_args + ["-pass", "2", "-c:a", AUDIO_CODEC, output_file]
-            # THE FIX: Run Popen without piping stdout/stderr to avoid deadlocks
-            process2 = subprocess.Popen(
-                pass2_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            monitor_ffmpeg_progress(
-                process2, total_frames, progress_file_path, "Pass 2/2 Encoding "
-            )
-            if process2.returncode != 0:
-                print(f"[ERROR] FFmpeg Pass 2 failed. Check for errors above.")
-                return False
+                # Pass 2
+                pass2_args = common_args + [
+                    "-pass",
+                    "2",
+                    "-c:a",
+                    AUDIO_CODEC,
+                    output_file,
+                ]
+                process2 = subprocess.Popen(
+                    pass2_args, stdout=log_file, stderr=subprocess.STDOUT
+                )
+                monitor_ffmpeg_progress(
+                    process2, total_frames, progress_file_path, "Pass 2/2 Encoding "
+                )
+                if process2.wait() != 0:
+                    print(f"\n[ERROR] FFmpeg Pass 2 failed. See log: {log_file_path}")
+                    return False
+
+            if os.path.exists(log_file_path):
+                os.remove(log_file_path)
             return True
 
         else:  # MODE is "CQ"
-            command = [
-                FFMPEG_PATH,
-                "-hwaccel",
-                "cuda",
-                "-i",
-                input_file,
+            command_to_run = base_args + [
                 "-c:v",
                 "hevc_nvenc",
                 "-preset",
@@ -248,32 +294,30 @@ def compress_video_gpu(
                 "-y",
                 "-progress",
                 progress_file_path,
-                "-loglevel",
-                "error",
             ]
             if preset_config.get("SCALE"):
-                command.extend(["-vf", f"scale_cuda={preset_config['SCALE']}"])
-            command.append(output_file)
+                command_to_run.extend(["-vf", f"scale_cuda={preset_config['SCALE']}"])
+            command_to_run.append(output_file)
 
-            # THE FIX: Run Popen without piping stdout/stderr to avoid deadlocks
-            process = subprocess.Popen(
-                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            with open(log_file_path, "w", encoding="utf-8") as log_file:
+                process = subprocess.Popen(
+                    command_to_run, stdout=log_file, stderr=subprocess.STDOUT
+                )
+
             monitor_ffmpeg_progress(
                 process, total_frames, progress_file_path, "Single Pass Encoding"
             )
-            if process.returncode != 0:
-                print(
-                    f"[ERROR] FFmpeg failed on {relative_path}. Check for errors above."
-                )
+
+            if process.wait() != 0:
+                print(f"\n[ERROR] FFmpeg process failed. See log: {log_file_path}")
                 return False
+
+            if os.path.exists(log_file_path):
+                os.remove(log_file_path)
             return True
 
     except FileNotFoundError:
-        print(
-            f"\n[FATAL ERROR] Cannot find ffmpeg. Please check the FFMPEG_PATH variable."
-        )
-        print(f"Current path is set to: '{FFMPEG_PATH}'")
+        print(f"\n[FATAL ERROR] Cannot find ffmpeg. Please check the FFMPEG_PATH.")
         sys.exit(1)
     finally:
         if os.path.exists(progress_file_path):
@@ -291,27 +335,30 @@ def process_files_recursively(root_input, root_output, preset_config):
 
     for i, input_path in enumerate(all_files):
         relative_path = os.path.relpath(input_path, root_input)
-        output_path = os.path.join(
-            root_output, os.path.splitext(relative_path)[0] + ".mp4"
-        )
-
         print(f"\n--- Processing file {i + 1} of {len(all_files)}: {relative_path} ---")
+
+        is_video = input_path.lower().endswith(VIDEO_EXTENSIONS)
+        output_path = (
+            os.path.join(root_output, os.path.splitext(relative_path)[0] + ".mp4")
+            if is_video
+            else os.path.join(root_output, relative_path)
+        )
 
         if os.path.exists(output_path):
             print("Output file already exists. Skipping.")
             continue
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        if not input_path.lower().endswith(VIDEO_EXTENSIONS):
+        if not is_video:
             print("Not a video file. Copying directly...")
             shutil.copy2(input_path, output_path)
             continue
 
         codec, bit_rate, total_frames = get_video_details(input_path)
-        if codec is None and bit_rate == 0:
-            print("Could not get details. Copying file.")
-            shutil.copy2(input_path, output_path)
-            continue
+        if total_frames == 0:
+            print(
+                "Warning: Could not determine total frames. Progress bar may not be accurate."
+            )
 
         bitrate_threshold_kbps = (
             TARGET_BITRATE_KBPS if preset_config["MODE"] == "VBR" else 2500
@@ -321,20 +368,27 @@ def process_files_recursively(root_input, root_output, preset_config):
             shutil.copy2(input_path, output_path)
             continue
 
-        print(f"Compressing (codec: {codec}, bitrate: {bit_rate/1000:.0f}kbps)...")
+        print(
+            f"Compressing (codec: {codec or 'unknown'}, bitrate: {bit_rate/1000:.0f}kbps)..."
+        )
         success = compress_video_gpu(
-            input_path, output_path, total_frames, relative_path, preset_config
+            input_path, output_path, total_frames, preset_config
         )
 
         if not success:
             print("Copying original due to compression error.")
+            if os.path.exists(output_path):
+                os.remove(output_path)
             shutil.copy2(input_path, output_path)
             continue
 
-        input_size, output_size = os.path.getsize(input_path), os.path.getsize(
-            output_path
-        )
+        input_size = os.path.getsize(input_path)
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            print("Output file not created or is empty. Copying original.")
+            shutil.copy2(input_path, output_path)
+            continue
 
+        output_size = os.path.getsize(output_path)
         if output_size >= input_size:
             print(f"Output larger. Copying original.")
             shutil.copy2(input_path, output_path)
@@ -354,7 +408,7 @@ if __name__ == "__main__":
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
 
-    print("--- GPU H.265 Video Compressor (v8) ---")
+    print("--- GPU H.265 Video Compressor (v17) ---")
     print(f"Selected Preset: '{SELECTED_PRESET}'")
     if config["MODE"] == "VBR":
         print(f"Mode: 2-Pass VBR | Target Bitrate: {TARGET_BITRATE_KBPS} kbps")
