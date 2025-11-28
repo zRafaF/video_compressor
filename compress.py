@@ -21,7 +21,7 @@ FFMPEG_PATH = "ffmpeg"
 SELECTED_PRESET = "best_quality_at_size"
 
 # 3. TARGET BITRATE (for "best_quality_at_size" preset ONLY)
-TARGET_BITRATE_KBPS = 2000
+TARGET_BITRATE_KBPS = 2300
 
 # 4. SET MINIMUM COMPRESSION (in percent)
 MINIMUM_COMPRESSION_PERCENT = 10
